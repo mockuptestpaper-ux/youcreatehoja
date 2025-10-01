@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { supabase } from '../lib/supabase';
 import { Question } from '../types/database';
 import { FileText, Mic, Captions, Video, CheckCircle, Loader, AlertCircle } from 'lucide-react';
@@ -28,10 +28,42 @@ export default function VideoCreationPanel({ courseId, question }: VideoCreation
   const [generatedScript, setGeneratedScript] = useState<GeneratedScript | null>(null);
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [availableVideos, setAvailableVideos] = useState<VideoRecord[]>([]);
 
   const GEMINI_API_KEY = 'AIzaSyDgShKEEeX9viEQ90JHAUBfwQqlu0c9rBw';
   const VOICE_API_KEY = 'sk_78d719766a3026b96c79d89fefeac203b978509b03404756';
   const VOICE_ID = 'ap2_01771851-fe5d-4e13-a843-a49b28e72ef9';
+
+  useEffect(() => {
+    loadExistingVideo();
+    loadAvailableVideos();
+  }, [question.id]);
+
+  const loadExistingVideo = async () => {
+    const { data } = await supabase
+      .from('videos')
+      .select('*')
+      .eq('question_id', question.id)
+      .maybeSingle();
+
+    if (data) {
+      setVideoRecord(data);
+    }
+  };
+
+  const loadAvailableVideos = async () => {
+    const { data } = await supabase
+      .from('videos')
+      .select('*')
+      .not('script', 'is', null)
+      .is('audio_url', null)
+      .order('created_at', { ascending: false })
+      .limit(10);
+
+    if (data) {
+      setAvailableVideos(data);
+    }
+  };
 
   const generateScript = async () => {
     setLoading('script');
@@ -114,7 +146,10 @@ Make the script conversational, engaging, and suitable for voice-over. Use simpl
         .select()
         .single();
 
-      if (dbError) throw dbError;
+      if (dbError) {
+        console.error('Database error:', dbError);
+        throw new Error(`Failed to save: ${dbError.message}`);
+      }
 
       await supabase
         .from('new_questions')
@@ -123,15 +158,21 @@ Make the script conversational, engaging, and suitable for voice-over. Use simpl
 
       setVideoRecord(video);
       setGeneratedScript(null);
+      await loadAvailableVideos();
     } catch (err: any) {
+      console.error('Save error:', err);
       setError(err.message);
     } finally {
       setLoading(null);
     }
   };
 
-  const generateVoiceOver = async () => {
-    if (!videoRecord?.script) return;
+  const generateVoiceOver = async (videoId?: string) => {
+    const targetVideo = videoId
+      ? availableVideos.find(v => v.id === videoId)
+      : videoRecord;
+
+    if (!targetVideo?.script) return;
 
     setLoading('audio');
     setError(null);
@@ -144,7 +185,7 @@ Make the script conversational, engaging, and suitable for voice-over. Use simpl
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          text: videoRecord.script,
+          text: targetVideo.script,
           voice_settings: {
             stability: 0.5,
             similarity_boost: 0.75
@@ -152,10 +193,13 @@ Make the script conversational, engaging, and suitable for voice-over. Use simpl
         })
       });
 
-      if (!response.ok) throw new Error('Failed to generate voice-over');
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Voice generation failed: ${errorText}`);
+      }
 
       const audioBlob = await response.blob();
-      const audioFileName = `audio_${videoRecord.id}.mp3`;
+      const audioFileName = `audio_${targetVideo.id}.mp3`;
 
       const { error: uploadError } = await supabase.storage
         .from('videos')
@@ -164,7 +208,10 @@ Make the script conversational, engaging, and suitable for voice-over. Use simpl
           upsert: true
         });
 
-      if (uploadError) throw uploadError;
+      if (uploadError) {
+        console.error('Upload error:', uploadError);
+        throw new Error(`Storage upload failed: ${uploadError.message}`);
+      }
 
       const { data: { publicUrl } } = supabase.storage
         .from('videos')
@@ -177,14 +224,19 @@ Make the script conversational, engaging, and suitable for voice-over. Use simpl
           status: 'audio_generated',
           updated_at: new Date().toISOString()
         })
-        .eq('id', videoRecord.id)
+        .eq('id', targetVideo.id)
         .select()
         .single();
 
-      if (updateError) throw updateError;
+      if (updateError) {
+        console.error('Update error:', updateError);
+        throw new Error(`Database update failed: ${updateError.message}`);
+      }
 
       setVideoRecord(updated);
+      await loadAvailableVideos();
     } catch (err: any) {
+      console.error('Voice-over error:', err);
       setError(err.message);
     } finally {
       setLoading(null);
@@ -376,7 +428,7 @@ Make the script conversational, engaging, and suitable for voice-over. Use simpl
         <div className="flex items-center gap-4">
           <div className="flex-1">
             <button
-              onClick={generateVoiceOver}
+              onClick={() => generateVoiceOver()}
               disabled={!videoRecord?.script || loading !== null}
               className={`w-full flex items-center justify-between p-4 rounded-lg transition-all ${
                 getStepStatus('audio') === 'completed'
@@ -399,6 +451,46 @@ Make the script conversational, engaging, and suitable for voice-over. Use simpl
             </button>
           </div>
         </div>
+
+        {/* Available Videos for Voice Over */}
+        {availableVideos.length > 0 && (
+          <div className="ml-8 p-4 bg-slate-700 rounded-lg">
+            <h4 className="text-white font-medium mb-3">Or select a script to generate voice-over:</h4>
+            <div className="space-y-2 max-h-60 overflow-y-auto">
+              {availableVideos.map((video) => (
+                <div
+                  key={video.id}
+                  className="flex items-center justify-between p-3 bg-slate-600 rounded hover:bg-slate-500 transition-colors"
+                >
+                  <div className="flex-1 mr-4">
+                    <p className="text-slate-300 text-sm line-clamp-2">
+                      {video.script?.substring(0, 100)}...
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => generateVoiceOver(video.id)}
+                    disabled={loading !== null}
+                    className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded disabled:opacity-50 whitespace-nowrap"
+                  >
+                    Generate Audio
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {videoRecord?.audio_url && (
+          <div className="ml-8 p-4 bg-slate-700 rounded-lg">
+            <h4 className="text-green-400 font-medium mb-2 flex items-center gap-2">
+              <CheckCircle className="w-4 h-4" />
+              Audio generated successfully
+            </h4>
+            <audio controls className="w-full mt-2">
+              <source src={videoRecord.audio_url} type="audio/mpeg" />
+            </audio>
+          </div>
+        )}
 
         {/* Step 3: Generate Captions */}
         <div className="flex items-center gap-4">
@@ -458,15 +550,25 @@ Make the script conversational, engaging, and suitable for voice-over. Use simpl
 
         {videoRecord?.video_url && (
           <div className="mt-6 p-4 bg-green-900/20 border border-green-500 rounded-lg">
-            <p className="text-green-400 font-medium mb-2">Video Ready!</p>
-            <a
-              href={videoRecord.video_url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-blue-400 hover:underline text-sm"
-            >
-              {videoRecord.video_url}
-            </a>
+            <p className="text-green-400 font-medium mb-3">Video Ready!</p>
+            <div className="flex gap-3">
+              <a
+                href={videoRecord.video_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors"
+              >
+                Preview Video
+              </a>
+              <a
+                href={videoRecord.video_url}
+                download={`video_${videoRecord.id}.mp4`}
+                className="px-6 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg transition-colors"
+              >
+                Download Video
+              </a>
+            </div>
+            <p className="text-slate-400 text-xs mt-3 break-all">{videoRecord.video_url}</p>
           </div>
         )}
       </div>

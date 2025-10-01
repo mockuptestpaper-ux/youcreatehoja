@@ -32,7 +32,7 @@ export default function VideoCreationPanel({ courseId, question }: VideoCreation
 
   const GEMINI_API_KEY = 'AIzaSyDgShKEEeX9viEQ90JHAUBfwQqlu0c9rBw';
   const VOICE_API_KEY = 'sk_78d719766a3026b96c79d89fefeac203b978509b03404756';
-  const VOICE_ID = 'ap2_01771851-fe5d-4e13-a843-a49b28e72ef9';
+  const VOICE_ID = '21m00Tcm4TlvDq8ikWAM';
 
   useEffect(() => {
     loadExistingVideo();
@@ -172,12 +172,20 @@ Make the script conversational, engaging, and suitable for voice-over. Use simpl
       ? availableVideos.find(v => v.id === videoId)
       : videoRecord;
 
-    if (!targetVideo?.script) return;
+    if (!targetVideo?.script) {
+      setError('No script available for voice generation');
+      return;
+    }
 
     setLoading('audio');
     setError(null);
 
     try {
+      const cleanScript = targetVideo.script
+        .replace(/\[COUNTDOWN:.*?\]/g, '')
+        .replace(/\*\*/g, '')
+        .trim();
+
       const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`, {
         method: 'POST',
         headers: {
@@ -185,31 +193,41 @@ Make the script conversational, engaging, and suitable for voice-over. Use simpl
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          text: targetVideo.script,
+          text: cleanScript,
+          model_id: 'eleven_monolingual_v1',
           voice_settings: {
             stability: 0.5,
-            similarity_boost: 0.75
+            similarity_boost: 0.75,
+            style: 0.0,
+            use_speaker_boost: true
           }
         })
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Voice generation failed: ${errorText}`);
+        const errorData = await response.json().catch(() => ({ message: 'Unknown error' }));
+        console.error('ElevenLabs error:', errorData);
+        throw new Error(`Voice generation failed: ${errorData.detail?.message || errorData.message || 'API error'}`);
       }
 
       const audioBlob = await response.blob();
-      const audioFileName = `audio_${targetVideo.id}.mp3`;
 
-      const { error: uploadError } = await supabase.storage
+      if (audioBlob.size === 0) {
+        throw new Error('Generated audio is empty');
+      }
+
+      const audioFileName = `audio_${targetVideo.id}_${Date.now()}.mp3`;
+
+      const { data: uploadData, error: uploadError } = await supabase.storage
         .from('videos')
         .upload(audioFileName, audioBlob, {
           contentType: 'audio/mpeg',
-          upsert: true
+          upsert: true,
+          cacheControl: '3600'
         });
 
       if (uploadError) {
-        console.error('Upload error:', uploadError);
+        console.error('Storage upload error:', uploadError);
         throw new Error(`Storage upload failed: ${uploadError.message}`);
       }
 
@@ -229,22 +247,39 @@ Make the script conversational, engaging, and suitable for voice-over. Use simpl
         .single();
 
       if (updateError) {
-        console.error('Update error:', updateError);
+        console.error('Database update error:', updateError);
         throw new Error(`Database update failed: ${updateError.message}`);
       }
 
       setVideoRecord(updated);
       await loadAvailableVideos();
+
+      if (videoId) {
+        const { data: refreshed } = await supabase
+          .from('videos')
+          .select('*')
+          .eq('id', videoId)
+          .maybeSingle();
+        if (refreshed) setVideoRecord(refreshed);
+      }
     } catch (err: any) {
       console.error('Voice-over error:', err);
-      setError(err.message);
+      setError(err.message || 'Failed to generate voice-over');
     } finally {
       setLoading(null);
     }
   };
 
   const generateCaptions = async () => {
-    if (!videoRecord?.audio_url) return;
+    if (!videoRecord?.audio_url) {
+      setError('Audio URL is required for caption generation');
+      return;
+    }
+
+    if (!videoRecord?.script) {
+      setError('Script is required for caption generation');
+      return;
+    }
 
     setLoading('captions');
     setError(null);
@@ -264,14 +299,21 @@ Make the script conversational, engaging, and suitable for voice-over. Use simpl
         })
       });
 
-      if (!response.ok) throw new Error('Failed to generate captions');
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: 'Unknown error' }));
+        throw new Error(`Caption generation failed: ${errorData.error || response.statusText}`);
+      }
 
-      const { captions } = await response.json();
+      const result = await response.json();
+
+      if (!result.success || !result.captions) {
+        throw new Error('Invalid caption data received');
+      }
 
       const { data: updated, error: updateError } = await supabase
         .from('videos')
         .update({
-          captions_data: captions,
+          captions_data: result.captions,
           status: 'captions_generated',
           updated_at: new Date().toISOString()
         })
@@ -279,18 +321,30 @@ Make the script conversational, engaging, and suitable for voice-over. Use simpl
         .select()
         .single();
 
-      if (updateError) throw updateError;
+      if (updateError) {
+        console.error('Database update error:', updateError);
+        throw new Error(`Failed to save captions: ${updateError.message}`);
+      }
 
       setVideoRecord(updated);
     } catch (err: any) {
-      setError(err.message);
+      console.error('Caption generation error:', err);
+      setError(err.message || 'Failed to generate captions');
     } finally {
       setLoading(null);
     }
   };
 
   const generateVideo = async () => {
-    if (!videoRecord?.captions_data) return;
+    if (!videoRecord?.captions_data) {
+      setError('Captions are required for video rendering');
+      return;
+    }
+
+    if (!videoRecord?.audio_url) {
+      setError('Audio is required for video rendering');
+      return;
+    }
 
     setLoading('video');
     setError(null);
@@ -305,18 +359,25 @@ Make the script conversational, engaging, and suitable for voice-over. Use simpl
         },
         body: JSON.stringify({
           video_id: videoRecord.id,
-          template_id: videoRecord.template_id
+          template_id: videoRecord.template_id || 1
         })
       });
 
-      if (!response.ok) throw new Error('Failed to render video');
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: 'Unknown error' }));
+        throw new Error(`Video rendering failed: ${errorData.error || response.statusText}`);
+      }
 
-      const { video_url } = await response.json();
+      const result = await response.json();
+
+      if (!result.success || !result.video_url) {
+        throw new Error('Invalid video URL received');
+      }
 
       const { data: updated, error: updateError } = await supabase
         .from('videos')
         .update({
-          video_url: video_url,
+          video_url: result.video_url,
           status: 'video_rendered',
           updated_at: new Date().toISOString()
         })
@@ -324,11 +385,15 @@ Make the script conversational, engaging, and suitable for voice-over. Use simpl
         .select()
         .single();
 
-      if (updateError) throw updateError;
+      if (updateError) {
+        console.error('Database update error:', updateError);
+        throw new Error(`Failed to save video: ${updateError.message}`);
+      }
 
       setVideoRecord(updated);
     } catch (err: any) {
-      setError(err.message);
+      console.error('Video rendering error:', err);
+      setError(err.message || 'Failed to render video');
     } finally {
       setLoading(null);
     }
